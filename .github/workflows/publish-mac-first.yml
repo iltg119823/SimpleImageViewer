@@ -1,0 +1,49 @@
+name: Publish Mac first
+on:
+  push:
+    paths: [.github/workflows/publish-mac-first.yml]
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+      - name: Wait for Mac artifact and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_id=43651483506
+          for attempt in $(seq 1 300); do
+            artifact=$(gh api "repos/$GH_REPO/actions/runs/$run_id/artifacts" --jq '.artifacts[] | select(.name == "binary-aarch64-apple-darwin" and .expired == false) | .id')
+            if [[ -n "$artifact" ]]; then
+              mkdir -p mac-release
+              gh run download "$run_id" -n binary-aarch64-apple-darwin -D mac-release
+              cd mac-release
+              test -s SimpleImageViewer-aarch64-apple-darwin.zip
+              unzip -t SimpleImageViewer-aarch64-apple-darwin.zip
+              sha256sum SimpleImageViewer-aarch64-apple-darwin.zip > SHA256SUMS-macos.txt
+              tag=v3.1.6-culling.1
+              if ! gh release view "$tag" >/dev/null 2>&1; then
+                gh release create "$tag" --target dd1df526c183cfd68c37e74409a8280c3b51a365 --prerelease --title "$tag — JPEG / RAW 选片" --notes-file ../CULLING_RELEASE.md
+              fi
+              gh release upload "$tag" SimpleImageViewer-aarch64-apple-darwin.zip SHA256SUMS-macos.txt --clobber
+              exit 0
+            fi
+            state=$(gh api "repos/$GH_REPO/actions/runs/$run_id/jobs" --jq '.jobs[] | select(.name == "Build (aarch64-apple-darwin)") | .conclusion')
+            if [[ "$state" == failure || "$state" == cancelled ]]; then
+              echo "::error::Mac build failed; inspect run $run_id"
+              exit 1
+            fi
+            echo "Waiting for Apple Silicon build (attempt $attempt)"
+            sleep 30
+          done
+          echo "::error::Timed out waiting for Mac build"
+          exit 1
