@@ -92,7 +92,9 @@ mod psb_simd_mul_div255;
 mod psb_vector_mask;
 mod psb_zip;
 mod raw_processor;
+mod raw_extensions;
 mod scanner;
+mod culling;
 #[cfg(target_os = "windows")]
 mod seh_handler;
 mod settings;

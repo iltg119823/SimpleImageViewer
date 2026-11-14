@@ -239,3 +239,7 @@ last_copy_cut_dir: "D:\\Photos"
 ## 许可证
 
 GNU General Public License v3 (GPL v3) — 详见 [LICENSE](LICENSE)。
+
+## JPEG / RAW 选片工作流
+
+本分支新增默认 JPEG 浏览、0–5 星评分、组合筛选与后台联动导出。使用方式、会话评分限制及验证说明见 [选片说明](CULLING_CN.md)。

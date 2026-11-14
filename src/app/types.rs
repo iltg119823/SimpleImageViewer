@@ -352,6 +352,7 @@ pub(crate) struct ContextMenuLabelCache {
 pub struct ImageViewerApp {
     // Core state
     pub(crate) settings: Settings,
+    pub(crate) culling: super::culling_ui::CullingUi,
     pub(crate) image_files: Vec<PathBuf>,
     /// Lazily-built path→index cache for strip preview relocation. Keyed by
     /// `image_list_generation` so any mutation that bumps the generation

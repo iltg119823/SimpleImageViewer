@@ -86,6 +86,9 @@ impl ImageViewerApp {
 
     /// Layer 1: Input handling for the main window (normal operation).
     fn handle_main_window_input(&mut self, ctx: &Context) {
+        if self.handle_culling_keys(ctx) {
+            return;
+        }
         let mut action: Option<AppAction> = None;
         let mut esc_consumed = false;
 

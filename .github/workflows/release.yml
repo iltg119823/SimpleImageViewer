@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+      - "!v*-culling.*"
   # Manually retry the full pipeline (e.g. after transient vcpkg/network failures).
   # Leave "Release tag" empty for build-only. Use "Which artifact to build" to run a single Rust target / Win7 legacy (saves CI time).
   # Set it to e.g. v2.0.0 to build that tag and create/update the GitHub Release.

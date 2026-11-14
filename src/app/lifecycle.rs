@@ -437,6 +437,7 @@ impl ImageViewerApp {
         let mut app = Self {
             yaml_save_tx,
             initial_image,
+            culling: Default::default(),
             image_files: Vec::new(),
             cached_image_strip_path_index: None,
             #[cfg(feature = "avif-native")]

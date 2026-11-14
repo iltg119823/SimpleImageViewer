@@ -1,0 +1,524 @@
+name: Photo Culling Release
+
+on:
+  push:
+    branches: [photo-culling-release]
+    tags:
+      - "v*-culling.*"
+  # Manually retry the full pipeline (e.g. after transient vcpkg/network failures).
+  # Leave "Release tag" empty for build-only. Use "Which artifact to build" to run a single Rust target / Win7 legacy (saves CI time).
+  # Set it to e.g. v2.0.0 to build that tag and create/update the GitHub Release.
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Create GitHub Release for this tag (e.g. v2.0.0). Leave empty for build-only."
+        required: false
+        default: ""
+        type: string
+      build_target:
+        description: "Which artifact to build (manual runs only; tag pushes always build the full matrix)."
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - x86_64-pc-windows-msvc
+          - aarch64-apple-darwin
+      clear_dnf_cache:
+        description: "Linux only: delete workspace .ci-cache/dnf before build (cold dnf; use sparingly)."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  # When dispatching manually with release_tag set, checkout and release use that tag; otherwise use the triggering ref.
+  CHECKOUT_REF: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.sha }}
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v3.1.6-culling.1') }}
+  MONKEY_SDK_VERSION: "1327"
+  MONKEY_SDK_DIR: "3rdparty/monkey-sdk"
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
+  # vcpkg accepts at most: nuget,<url>[,read|readwrite] — token cannot be a 4th segment (parse error).
+  # Use apikeys in nuget.config (below) so nuget push finds an API key for GPR.
+  VCPKG_BINARY_SOURCES: "clear;nuget,https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json,readwrite"
+  VCPKG_NUGET_REPOSITORY: "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json"
+  VCPKG_KEEP_ENV_VARS: "PKG_CONFIG;M4;AUTOCONF;AUTOMAKE;LIBTOOL;GETTEXT;VCPKG_MAKE_BUILD_TRIPLET"
+
+jobs:
+  # GitHub does not allow `matrix.*` in job-level `if`; filter the matrix here instead.
+  matrix-prep:
+    runs-on: ubuntu-latest
+    outputs:
+      include_json: ${{ steps.set.outputs.include_json }}
+      targets_count: ${{ steps.set.outputs.targets_count }}
+    steps:
+      - id: set
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BUILD_TARGET: ${{ github.event.inputs.build_target || 'all' }}
+        run: |
+          python3 <<'PY'
+          import json, os
+
+          rows = [{'os': 'windows-latest',
+            'target': 'x86_64-pc-windows-msvc',
+            'vcpkg_cache_suffix': 'baseline-40a678a',
+            'binary_name': 'SimpleImageViewer.exe',
+            'archive_ext': '.zip',
+            'use_cross': False},
+           {'os': 'macos-26',
+            'target': 'aarch64-apple-darwin',
+            'vcpkg_cache_suffix': 'baseline-40a678a',
+            'binary_name': 'SimpleImageViewer',
+            'archive_ext': '.zip',
+            'use_cross': False}]
+
+          ev = os.environ["EVENT_NAME"]
+          bt = (os.environ.get("BUILD_TARGET") or "all").strip() or "all"
+
+          if ev != "workflow_dispatch" or bt == "all":
+              chosen = rows
+          else:
+              chosen = [r for r in rows if r["target"] == bt]
+
+          compact = json.dumps(chosen, separators=(",", ":"))
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as f:
+              f.write(f"targets_count={len(chosen)}\n")
+              f.write("include_json<<JSON_DELIM\n")
+              f.write(compact + "\n")
+              f.write("JSON_DELIM\n")
+          PY
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: matrix-prep
+    if: needs.matrix-prep.outputs.targets_count != '0'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix-prep.outputs.include_json) }}
+    env:
+      VCPKG_DEFAULT_TRIPLET: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'arm64-linux-v8a' || (matrix.target == 'x86_64-unknown-linux-gnu' && 'x64-linux' || 'na') }}
+      VCPKG_HOST_TRIPLET: ${{ contains(matrix.os, 'windows') && 'x64-windows' || (contains(matrix.os, 'macos') && (matrix.target == 'aarch64-apple-darwin' && 'arm64-osx' || 'x64-osx') || 'x64-linux') }}
+      # Ubuntu host: system pkg-config. macOS: Homebrew on PATH. Windows: unset here; see Install pkg-config step.
+      PKG_CONFIG: ${{ contains(matrix.os, 'ubuntu') && '/usr/bin/pkg-config' || (contains(matrix.os, 'macos') && 'pkg-config' || '') }}
+      # Hosted macOS/Windows images may set VCPKG_FORCE_SYSTEM_BINARIES; vcpkg then refuses to
+      # download its bundled NuGet and GPR binary caching fails with "Could not fetch nuget".
+      VCPKG_FORCE_SYSTEM_BINARIES: ""
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Clear dnf workspace cache (manual opt-in)
+        if: runner.os == 'Linux' && github.event_name == 'workflow_dispatch' && github.event.inputs.clear_dnf_cache == 'true'
+        run: rm -rf "${{ github.workspace }}/.ci-cache/dnf"
+
+      - name: Setup NASM
+        if: runner.os != 'Linux'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Export vcpkg triplet
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            if [[ "${{ matrix.target }}" == "x86_64"* ]]; then echo "VCPKG_DEFAULT_TRIPLET=x64-windows-static" >> $GITHUB_ENV;
+            elif [[ "${{ matrix.target }}" == "i686"* ]]; then echo "VCPKG_DEFAULT_TRIPLET=x86-windows-static" >> $GITHUB_ENV;
+            elif [[ "${{ matrix.target }}" == "aarch64"* ]]; then echo "VCPKG_DEFAULT_TRIPLET=arm64-windows-static" >> $GITHUB_ENV; fi
+          elif [[ "${{ matrix.target }}" == *"apple-darwin"* ]]; then
+            if [[ "${{ matrix.target }}" == "x86_64"* ]]; then echo "VCPKG_DEFAULT_TRIPLET=x64-osx" >> $GITHUB_ENV;
+            elif [[ "${{ matrix.target }}" == "aarch64"* ]]; then echo "VCPKG_DEFAULT_TRIPLET=arm64-osx" >> $GITHUB_ENV; fi
+          fi
+
+      - name: Restore vcpkg + dnf caches (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/cache@v5
+        with:
+          path: |
+            vcpkg_installed
+            .ci-cache/dnf
+          key: vcpkg-${{ matrix.target }}-${{ matrix.vcpkg_cache_suffix }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'scripts/ci/alma8-linux-build.sh', 'triplets/arm64-linux-v8a.cmake', 'triplets/x64-linux.cmake', 'vcpkg-overlays/libyuv/portfile.cmake', 'vcpkg-overlays/libyuv/linux-arm64-libyuv-as.cmake', 'vcpkg-overlays/libyuv/cmake.diff', 'vcpkg-overlays/libyuv/arm64-disable-dotprod-i8mm.patch', 'vcpkg-overlays/x265/portfile.cmake') }}
+          restore-keys: |
+            vcpkg-${{ matrix.target }}-${{ matrix.vcpkg_cache_suffix }}-
+
+      - name: Prepare vcpkg checkout (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=$(jq -r '."builtin-baseline"' vcpkg.json)
+          [[ -n "$BASE" && "$BASE" != "null" ]]
+          rm -rf vcpkg
+          git clone --filter=blob:none https://github.com/microsoft/vcpkg.git vcpkg
+          git config --global --add safe.directory "${{ github.workspace }}/vcpkg"
+          git -C vcpkg checkout "$BASE"
+
+      - name: Setup vcpkg (Windows / macOS)
+        if: runner.os != 'Linux'
+        uses: lukka/run-vcpkg@v11
+        with:
+          runVcpkgInstall: false
+          vcpkgJsonGlob: 'vcpkg.json'
+          vcpkgConfigurationJsonGlob: 'vcpkg-configuration.json'
+
+      - name: Ensure dnf cache dir (Linux host)
+        if: runner.os == 'Linux'
+        run: mkdir -p "${{ github.workspace }}/.ci-cache/dnf"
+
+      - name: Configure vcpkg NuGet Binary Source
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cat <<EOF > nuget.config
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <add key="GitHub" value="https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" />
+            </packageSources>
+            <packageSourceCredentials>
+              <GitHub>
+                <add key="Username" value="${{ github.actor }}" />
+                <add key="ClearTextPassword" value="${{ secrets.GITHUB_TOKEN }}" />
+              </GitHub>
+            </packageSourceCredentials>
+          </configuration>
+          EOF
+
+      - name: Build in AlmaLinux 8 container (glibc 2.28)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          WS="${{ github.workspace }}"
+          mkdir -p "$WS/.ci-cache/dnf"
+          if [[ "${{ matrix.target }}" == aarch64-unknown-linux-gnu ]]; then
+            DOCKER_PLATFORM=linux/arm64
+          else
+            DOCKER_PLATFORM=linux/amd64
+          fi
+          docker run --rm \
+            --platform "${DOCKER_PLATFORM}" \
+            -v "${WS}:/workspace" \
+            -v "${WS}/.ci-cache/dnf:/var/cache/dnf" \
+            -w /workspace \
+            -e GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}" \
+            -e GITHUB_REPOSITORY_OWNER="${{ github.repository_owner }}" \
+            -e GITHUB_ACTOR="${{ github.actor }}" \
+            -e "VCPKG_BINARY_SOURCES=${{ env.VCPKG_BINARY_SOURCES }}" \
+            -e MONKEY_SDK_VERSION="${{ env.MONKEY_SDK_VERSION }}" \
+            -e MONKEY_SDK_DIR="${{ env.MONKEY_SDK_DIR }}" \
+            almalinux:8 \
+            bash /workspace/scripts/ci/alma8-linux-build.sh "${{ matrix.target }}"
+          sudo chown -R "$(id -u):$(id -g)" "$WS" || true
+
+      - name: Restore vcpkg_installed (Windows / macOS)
+        if: runner.os != 'Linux'
+        uses: actions/cache@v5
+        with:
+          path: vcpkg_installed
+          key: vcpkg-${{ matrix.target }}-${{ matrix.vcpkg_cache_suffix }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'vcpkg-overlays/libyuv/portfile.cmake', 'vcpkg-overlays/libyuv/linux-arm64-libyuv-as.cmake', 'vcpkg-overlays/libyuv/cmake.diff', 'vcpkg-overlays/libyuv/arm64-disable-dotprod-i8mm.patch', 'vcpkg-overlays/x265/portfile.cmake') }}
+          restore-keys: |
+            vcpkg-${{ matrix.target }}-${{ matrix.vcpkg_cache_suffix }}-
+
+      - name: Configure vcpkg NuGet Binary Source
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          cat <<EOF > nuget.config
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <add key="GitHub" value="https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" />
+            </packageSources>
+            <packageSourceCredentials>
+              <GitHub>
+                <add key="Username" value="${{ github.actor }}" />
+                <add key="ClearTextPassword" value="${{ secrets.GITHUB_TOKEN }}" />
+              </GitHub>
+            </packageSourceCredentials>
+          </configuration>
+          EOF
+
+      - name: Install Mono and NuGet for vcpkg (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # LibRaw openmp: Apple Clang needs Homebrew libomp at configure time.
+          brew install libomp
+          # vcpkg GPR binary caching runs NuGet.exe under Mono on macOS (same pattern as AlmaLinux CI).
+          brew install mono
+          mono --version
+          mkdir -p "${{ github.workspace }}/.nuget-tools"
+          NUGET_EXE="${{ github.workspace }}/.nuget-tools/nuget.exe"
+          if [[ ! -f "${NUGET_EXE}" ]]; then
+            curl -fsSL -o "${NUGET_EXE}" "https://dist.nuget.org/win-x86-commandline/v7.3.1/nuget.exe"
+          fi
+          SOURCE="https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json"
+          mono "${NUGET_EXE}" setApiKey "${{ secrets.GITHUB_TOKEN }}" -Source "${SOURCE}" || true
+
+      - name: Install pkg-config (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/ci/install-pkg-config-windows.ps1
+
+      - name: Install vcpkg dependencies
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset VCPKG_FORCE_SYSTEM_BINARIES
+          echo "DEBUG: Current PWD is $(pwd)"
+          export NUGET_CONFIGFILE="${{ github.workspace }}/nuget.config"
+          if vcpkg install --triplet="$VCPKG_DEFAULT_TRIPLET" --overlay-ports="$(pwd)/vcpkg-overlays" --overlay-triplets="$(pwd)/triplets" 2>&1 | tee vcpkg_build.log; then
+            :
+          else
+            echo "::error::vcpkg install failed. Showing only paths vcpkg printed (lines ending in .log)."
+            (grep -iE '\.log$' vcpkg_build.log || true) | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | sort -u | while read -r log_file; do
+              [[ -z "$log_file" ]] && continue
+              if [[ -f "$log_file" ]]; then
+                echo "::group::vcpkg failure log: $log_file"
+                cat "$log_file"
+                echo "::endgroup::"
+              fi
+            done
+            exit 1
+          fi
+
+      - name: Collect vcpkg failure logs (Linux)
+        if: failure() && runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p vcpkg-failure-logs
+          root="${{ github.workspace }}/vcpkg"
+          if [[ ! -d "$root/buildtrees" ]]; then
+            echo "No vcpkg buildtrees (skipping artifact staging)"
+            exit 0
+          fi
+          n=0
+          while IFS= read -r -d '' f; do
+            rel="${f#"$root/buildtrees/"}"
+            safe="${rel//\//_}"
+            cp -f "$f" "vcpkg-failure-logs/${n}_${safe}" || true
+            n=$((n + 1))
+          done < <(find "$root/buildtrees" -type f \( \
+            -name 'install-*-out.log' -o -name 'install-*-err.log' \
+            -o -name 'config-*-out.log' -o -name 'config-*-err.log' \
+            \) -print0 2>/dev/null)
+          ls -la vcpkg-failure-logs || true
+
+      - name: Upload vcpkg failure logs (Linux)
+        if: failure() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: vcpkg-logs-${{ matrix.target }}
+          path: vcpkg-failure-logs/
+          if-no-files-found: ignore
+
+
+      - name: Setup Monkey's Audio SDK (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://monkeysaudio.com/files/MAC_${{ env.MONKEY_SDK_VERSION }}_SDK.zip" -OutFile "monkey_sdk.zip"
+          Expand-Archive monkey_sdk.zip -DestinationPath "temp_monkey"
+          if (!(Test-Path "${{ env.MONKEY_SDK_DIR }}")) { New-Item -ItemType Directory -Force -Path "${{ env.MONKEY_SDK_DIR }}" }
+          Copy-Item -Path "temp_monkey/*" -Destination "${{ env.MONKEY_SDK_DIR }}/" -Recurse -Force
+
+      - name: Setup Monkey's Audio SDK (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          curl -L https://monkeysaudio.com/files/MAC_${{ env.MONKEY_SDK_VERSION }}_SDK.zip -o monkey_sdk.zip
+          unzip monkey_sdk.zip -d temp_monkey
+          mkdir -p ${{ env.MONKEY_SDK_DIR }}
+          cp -rn temp_monkey/* ${{ env.MONKEY_SDK_DIR }}/
+
+      - name: Export NASM path for build scripts
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          NASM_BIN=$(which nasm || which nasm.exe || echo "")
+          if [ -n "$NASM_BIN" ]; then
+            echo "NASM=$NASM_BIN" >> $GITHUB_ENV
+            echo "NASM set to $NASM_BIN"
+            nasm -v
+          else
+            echo "ERROR: nasm not found in PATH after setup" && exit 1
+          fi
+
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+        if: runner.os != 'Linux'
+
+      - name: Rust Cache
+        if: runner.os != 'Linux'
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v24-ci-profile
+          key: ${{ matrix.target }}
+          env-vars: CC_x86_64_unknown_linux_gnu CXX_x86_64_unknown_linux_gnu CC_aarch64_unknown_linux_gnu CXX_aarch64_unknown_linux_gnu
+
+      - name: Test photo selection and export
+        shell: bash
+        run: |
+          rustc --edition 2024 --test tests/culling_standalone.rs -o culling-tests${{ runner.os == 'Windows' && '.exe' || '' }}
+          ./culling-tests${{ runner.os == 'Windows' && '.exe' || '' }}
+
+      - name: Build Release (Native)
+        if: "!matrix.use_cross"
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            export RUSTFLAGS="-C target-feature=+crt-static"
+          fi
+          cargo build --profile ci --target ${{ matrix.target }}
+
+      - name: Run SIMD Parity Tests (Native)
+        if: "!matrix.use_cross && matrix.target != 'aarch64-pc-windows-msvc'"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Test simd_swizzle via the minimal lib target — the full binary harness links
+          # mimalloc/CRT/SEH and can ACCESS_VIOLATION on Windows GA before any case runs.
+          cargo test --profile ci --target ${{ matrix.target }} --lib simd_swizzle
+
+      - name: Check glibc compatibility
+        if: runner.os == 'Linux'
+        run: |
+          BINARY="target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
+          if [ ! -f "$BINARY" ]; then
+            echo "::error::Linux release binary missing at $BINARY (cannot verify glibc / libstdc++)."
+            exit 1
+          fi
+          echo "Checking glibc version requirements for $BINARY"
+          # Extract highest GLIBC version from symbol versions
+          MAX_GLIBC=$(strings "$BINARY" | grep "^GLIBC_2" | sort -V | tail -n 1)
+          echo "Maximum GLIBC version required: $MAX_GLIBC"
+          # also show whether libstdc++ stayed dynamic (expect: no NEEDED libstdc++.so if fully satisfied from .a)
+          readelf -d "$BINARY" | grep NEEDED || true
+          if readelf -d "$BINARY" | grep -q 'libstdc\+\+\.so'; then
+            echo "::error::Binary must not list libstdc++.so in NEEDED; use .cargo/g++-lld-wrap.sh as linker + -static-libstdc++ (see .cargo/config.toml); or SIV_NO_LLD=1 with bfd ld."
+            exit 1
+          else
+            echo "OK: no libstdc++.so in NEEDED (libstdc++ linked statically)."
+          fi
+          if readelf -d "$BINARY" | grep -q 'libgomp\.so'; then
+            echo "::error::Binary must not list libgomp.so in NEEDED; libraw-sys should link static gomp (see libraries/libraw-sys/build.rs)."
+            exit 1
+          else
+            echo "OK: no libgomp.so in NEEDED (libgomp linked statically)."
+          fi
+
+      - name: Package Artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archiveName = "SimpleImageViewer-${{ matrix.target }}${{ matrix.archive_ext }}"
+          $binarySrc = "target/${{ matrix.target }}/ci/${{ matrix.binary_name }}"
+          mkdir staging/assets
+          cp $binarySrc, README.md, README_CN.md, CULLING_CN.md, LICENSE staging/
+          cp assets/screenshot.jpg staging/assets/
+          $openmpArch = if ('${{ matrix.target }}' -like 'aarch64*') { 'arm64' } elseif ('${{ matrix.target }}' -like 'i686*') { 'x86' } else { 'x64' }
+          & ./scripts/ci/copy-vcomp140.ps1 -StagingDir staging -Arch $openmpArch
+          Compress-Archive -Path staging/* -DestinationPath $archiveName
+          echo "ARCHIVE_NAME=$archiveName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Package Artifacts (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          bash scripts/ci/package-culling-macos.sh
+          echo "ARCHIVE_NAME=SimpleImageViewer-aarch64-apple-darwin.zip" >> "$GITHUB_ENV"
+
+      - name: Package Artifacts (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          ARCHIVE_NAME="SimpleImageViewer-${{ matrix.target }}${{ matrix.archive_ext }}"
+          mkdir -p staging/assets
+          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} staging/
+          cp README.md README_CN.md LICENSE staging/
+          cp assets/screenshot.jpg staging/assets/
+          tar -czvf $ARCHIVE_NAME -C staging .
+          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.target }}
+          path: ${{ env.ARCHIVE_NAME }}
+
+      - name: Archive PDB symbols (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $pdbPath = "target/${{ matrix.target }}/ci/SimpleImageViewer.pdb"
+          if (Test-Path $pdbPath) {
+            $zipName = "SimpleImageViewer-${{ matrix.target }}-pdb.zip"
+            Compress-Archive -Path $pdbPath -DestinationPath $zipName
+            echo "PDB_ZIP=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
+      - name: Upload PDB artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: pdb-${{ matrix.target }}
+          path: ${{ env.PDB_ZIP }}
+          if-no-files-found: warn
+
+  create-release:
+    name: Create Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    if: success() && (github.event_name == 'push' || github.event.inputs.release_tag != '')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Prepare release notes
+        run: cp CULLING_RELEASE.md RELEASE_NOTES.md
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-artifacts
+          merge-multiple: true
+          pattern: binary-*
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          cd release-artifacts
+          rm -f SHA256SUMS.txt
+          find . -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) \
+            ! -name '*-pdb.zip' -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | sed 's#  ./#  #' > SHA256SUMS.txt
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS.txt
+
+      - name: Create or Update Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          gh release create "${RELEASE_TAG}" release-artifacts/* \
+            --target "${GITHUB_SHA}" --prerelease --title "${RELEASE_TAG} — JPEG / RAW 选片" \
+            --notes-file RELEASE_NOTES.md || \
+          (gh release edit "${RELEASE_TAG}" --notes-file RELEASE_NOTES.md && \
+           gh release upload "${RELEASE_TAG}" release-artifacts/* --clobber)

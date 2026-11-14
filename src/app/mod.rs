@@ -35,6 +35,7 @@ pub(crate) mod rfd_parent;
 pub(crate) mod view_status;
 
 mod app_methods;
+mod culling_ui;
 mod eframe_app;
 mod hotkeys_ui;
 mod logic_update;

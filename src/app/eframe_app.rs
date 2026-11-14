@@ -233,6 +233,7 @@ impl eframe::App for ImageViewerApp {
         self.draw_embedded_directory_tree_panel(ui);
         // Keyboard must run from ROOT ui(), not logic(): logic() runs before integration.update
         // applies raw_input and also runs on deferred child repaints with the wrong pass input.
+        self.draw_culling_bar(ui);
         self.handle_keyboard(&ctx);
 
         self.prepare_directory_tree_file_list_viewport(&ctx);

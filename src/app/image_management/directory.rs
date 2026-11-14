@@ -202,8 +202,8 @@ impl ImageViewerApp {
         self.scanning = true;
         self.status_message = t!("status.scanning", dir = dir_name).to_string();
         let recursive = self.effective_scan_recursive();
-        let paired_raw = self.settings.paired_raw_jpeg_handling;
-        let paired_psd = self.settings.paired_psd_jpeg_handling;
+        let paired_raw = self.culling_pair_policy(self.settings.paired_raw_jpeg_handling);
+        let paired_psd = self.culling_pair_policy(self.settings.paired_psd_jpeg_handling);
         #[cfg(feature = "preload-debug")]
         {
             crate::preload_debug!(
@@ -383,8 +383,8 @@ impl ImageViewerApp {
         scanner::scan_directory(
             dir,
             self.effective_scan_recursive(),
-            self.settings.paired_raw_jpeg_handling,
-            self.settings.paired_psd_jpeg_handling,
+            self.culling_pair_policy(self.settings.paired_raw_jpeg_handling),
+            self.culling_pair_policy(self.settings.paired_psd_jpeg_handling),
             scan_generation,
             tx,
             cancel,
@@ -495,6 +495,9 @@ impl ImageViewerApp {
                     }
                     let is_first_batch = self.image_files.is_empty();
                     for (path, len, modified_unix) in files {
+                        if !self.culling.selection.accepts(&path) {
+                            continue;
+                        }
                         self.image_files.push(path);
                         self.file_byte_len_by_index.push(len);
                         self.file_modified_unix_by_index.push(modified_unix);
