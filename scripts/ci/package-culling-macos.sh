@@ -34,6 +34,6 @@ for macho in "$binary" "$app"/Contents/Frameworks/*.dylib; do
 done
 codesign --force --sign - "$app"
 codesign --verify --deep --strict "$app"
-lipo -verify_arch arm64 "$binary"
+lipo "$binary" -verify_arch arm64
 ditto -c -k --sequesterRsrc --keepParent "$app" SimpleImageViewer-aarch64-apple-darwin.zip
 zip -j SimpleImageViewer-aarch64-apple-darwin.zip README.md README_CN.md CULLING_CN.md LICENSE
