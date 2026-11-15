@@ -20,7 +20,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          run_id=43651483506
+          run_id=43695477161
           for attempt in $(seq 1 300); do
             artifact=$(gh api "repos/$GH_REPO/actions/runs/$run_id/artifacts" --jq '.artifacts[] | select(.name == "binary-aarch64-apple-darwin" and .expired == false) | .id')
             if [[ -n "$artifact" ]]; then
@@ -32,9 +32,13 @@ jobs:
               sha256sum SimpleImageViewer-aarch64-apple-darwin.zip > SHA256SUMS-macos.txt
               tag=v3.1.6-culling.1
               if ! gh release view "$tag" >/dev/null 2>&1; then
-                gh release create "$tag" --target dd1df526c183cfd68c37e74409a8280c3b51a365 --prerelease --title "$tag — JPEG / RAW 选片" --notes-file ../CULLING_RELEASE.md
+                gh release create "$tag" --target 3798dbe1b5937022689109ed9e66b5c3ed0a2ec8 --prerelease --title "$tag — JPEG / RAW 选片" --notes-file ../CULLING_RELEASE.md
               fi
               gh release upload "$tag" SimpleImageViewer-aarch64-apple-darwin.zip SHA256SUMS-macos.txt --clobber
+              gh run download 43651483506 -n binary-x86_64-pc-windows-msvc -D .
+              unzip -t SimpleImageViewer-x86_64-pc-windows-msvc.zip
+              sha256sum SimpleImageViewer-*.zip > SHA256SUMS.txt
+              gh release upload "$tag" SimpleImageViewer-x86_64-pc-windows-msvc.zip SHA256SUMS.txt --clobber
               exit 0
             fi
             state=$(gh api "repos/$GH_REPO/actions/runs/$run_id/jobs" --jq '.jobs[] | select(.name == "Build (aarch64-apple-darwin)") | .conclusion')
